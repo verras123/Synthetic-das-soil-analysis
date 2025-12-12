@@ -1,0 +1,363 @@
+#!/usr/bin/env python3
+"""
+
+ 1. Montagem do Drive (force_remount)
+ 2. Escolha interativa de solo (ground truth)
+ 3. Lista ampliada de classes geotécnicas (11 tipos)
+ 4. Simulação de perfil homogêneo conforme solo escolhido
+ 5. FDTD 1D + extração de strain
+ 6. Simulação C-OTDR: modulação de fase, heteródina, gating, ADC, unwrap
+ 7. Inversão Vp (fast-time & slow-time) com tratamento de zeros
+ 8. Extração multi-feature (atenuação, centróide, energia)
+ 9. Classificação inicial por faixa e estatísticas (PT-BR)
+10. Rede Neural Softmax com validação cruzada StratifiedKFold
+11. Predição probabilística e top-2 classes por gauge
+12. Cálculo de acurácia vs ground truth
+13. Plots completos com legendas legíveis e explicações (inclusive heatmap)
+14. Salvamento de HDF5 e PNGs no Drive com todos os dados
+"""
+
+# 1) Montagem do Google Drive
+from google.colab import drive
+drive.mount('/content/drive', force_remount=True)
+
+import os
+import numpy as np
+import h5py
+import matplotlib.pyplot as plt
+from scipy.signal import hilbert, find_peaks
+import pandas as pd
+from sklearn.model_selection import StratifiedKFold
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense, Dropout, Input
+from tensorflow.keras.utils import to_categorical
+
+OUTPUT_DIR = '/content/drive/MyDrive/PhotonDAM_output'
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# 2) Lista de classes e mapeamento de velocidade típica
+classes_list = [
+    'Turfa/Lama', 'Loam', 'Argila mole', 'Argila firme/Limo',
+    'Silt Arenoso', 'Areia solta', 'Areia densa/Seixo',
+    'Areia/Gravel', 'Rocha macia', 'Xisto/Calcário', 'Basalto/Granito'
+]
+vel_map = {
+    'Turfa/Lama': 100,
+    'Loam': 250,
+    'Argila mole': 400,
+    'Argila firme/Limo': 600,
+    'Silt Arenoso': 900,
+    'Areia solta': 1350,
+    'Areia densa/Seixo': 1750,
+    'Areia/Gravel': 2250,
+    'Rocha macia': 3000,
+    'Xisto/Calcário': 4000,
+    'Basalto/Granito': 5500
+}
+
+# 3) Funções utilitárias
+def generate_reflectors(M, n_gauges, scale):
+    amps = np.random.rayleigh(scale, size=(M, n_gauges))
+    phases = np.random.uniform(0, 2*np.pi, size=(M, n_gauges))
+    return np.sum(amps * np.exp(1j * phases), axis=0)
+
+def ricker_wavelet(f0, duration, dt):
+    t = np.arange(-duration/2, duration/2, dt)
+    pi2 = (np.pi**2) * f0**2
+    sig = (1 - 2*pi2*t**2) * np.exp(-pi2*t**2)
+    return sig, t
+
+def simulate_fdtd(v, dz, dt, source, src_pos):
+    nz, nt = len(v), len(source)
+    u = np.zeros((nz, nt))
+    c2 = (v * dt / dz)**2
+    for n in range(1, nt-1):
+        u[1:-1, n+1] = (
+            2*u[1:-1, n] - u[1:-1, n-1]
+            + c2[1:-1] * (u[2:, n] - 2*u[1:-1, n] + u[:-2, n])
+        )
+        u[src_pos, n+1] += source[n]
+    return u
+
+def simulate_das(strain, phasors, z, params):
+    n_g, n_f = strain.shape
+    # 5.1) Modulação de fase + ruído
+    phi = 4*np.pi * params['n_refr'] / params['lambda0'] * strain * params['dz']
+    phi += np.random.normal(scale=params['sigma_phi'], size=phi.shape)
+    # 5.2) Mistura heteródina
+    t_fast = np.arange(n_f) * params['dt_fast']
+    field = phasors[:,None] * np.exp(1j*(phi + params['omega_if']*t_fast))
+    raw_if = field.real
+    # 5.3) Gating fast-time
+    gated = np.zeros((n_g, params['n_pulses']))
+    idx0 = np.round(2*z/(params['c_group']*params['dt_fast'])).astype(int)
+    for k in range(params['n_pulses']):
+        shift = int(k*(1/params['prf'])/params['dt_fast'])
+        for i, start in enumerate(idx0):
+            s = max(0, start+shift)
+            e = min(n_f, s+params['gating_window'])
+            blk = raw_if[i, s:e]
+            gated[i,k] = blk.mean() if blk.size else 0.0
+    # 5.4) ADC 12-bit + ruído
+    lsb = params['full_scale']/(2**params['adc_bits'])
+    noise_q = lsb/np.sqrt(12)
+    gated_q = np.round(gated/lsb)*lsb + np.random.normal(scale=noise_q, size=gated.shape)
+    # 5.5) Unwrap slow-time
+    analytic = hilbert(gated_q, axis=1)
+    ph_inst = np.unwrap(np.angle(analytic), axis=1)
+    ph_inst -= ph_inst[:,[0]]
+    dphi = np.diff(ph_inst, axis=1)
+    strain_est = dphi/(4*np.pi*params['n_refr']/params['lambda0']*params['dz'])
+    return raw_if, gated_q, strain_est
+
+def invert_vp_fast(z, dt_fast, c_group):
+    t_arr = np.round(2*z/(c_group*dt_fast)).astype(int)*dt_fast
+    vp = (2*z)/t_arr
+    vp[t_arr==0] = np.nan
+    return vp, t_arr
+
+def invert_vp_slow(strain_est, prf, z):
+    idx = np.argmax(np.abs(strain_est), axis=1)
+    t_arr = idx/prf
+    vp = z/t_arr
+    vp[t_arr==0] = np.nan
+    return vp, t_arr, idx
+
+def spectral_centroid(signal, fs):
+    S = np.abs(np.fft.rfft(signal))
+    freqs = np.fft.rfftfreq(len(signal), 1/fs)
+    return np.sum(freqs*S)/np.sum(S)
+
+def classify_soil_complex(vp):
+    cls = np.empty(vp.shape, dtype='<U20')
+    cls[vp<300]                   = 'Turfa/Lama'
+    cls[(vp>=300)&(vp<500)]      = 'Loam'
+    cls[(vp>=500)&(vp<700)]      = 'Argila mole'
+    cls[(vp>=700)&(vp<900)]      = 'Argila firme/Limo'
+    cls[(vp>=900)&(vp<1200)]     = 'Silt Arenoso'
+    cls[(vp>=1200)&(vp<1500)]    = 'Areia solta'
+    cls[(vp>=1500)&(vp<2000)]    = 'Areia densa/Seixo'
+    cls[(vp>=2000)&(vp<2500)]    = 'Areia/Gravel'
+    cls[(vp>=2500)&(vp<3500)]    = 'Rocha macia'
+    cls[(vp>=3500)&(vp<5000)]    = 'Xisto/Calcário'
+    cls[vp>=5000]                = 'Basalto/Granito'
+    return cls
+
+def extract_features(raw_if, strain_est, z, dt_fast):
+    n_g, n_f = raw_if.shape
+    env_all = np.abs(hilbert(raw_if, axis=1))
+    energia = np.trapezoid(env_all, dx=dt_fast, axis=1)
+    decay = np.zeros(n_g)
+    for i in range(n_g):
+        y = np.log(env_all[i] + 1e-12)
+        x = np.arange(len(y))
+        m, _ = np.polyfit(x, y, 1)
+        decay[i] = -m
+    cents = np.array([spectral_centroid(raw_if[i], 1/dt_fast) for i in range(n_g)])
+    return np.vstack([decay, cents, energia]).T
+
+def build_model(input_dim, n_classes):
+    model = Sequential()
+    model.add(Input(shape=(input_dim,)))
+    model.add(Dense(64, activation='relu'))
+    model.add(Dropout(0.2))
+    model.add(Dense(32, activation='relu'))
+    model.add(Dense(n_classes, activation='softmax'))
+    model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
+    return model
+
+# 11) Função principal
+def main():
+    # Seleção interativa de solo
+    print('Selecione o solo para simular e testar:')
+    for i, cls in enumerate(classes_list,1):
+        print(f'{i}: {cls}')
+    sel = int(input('Digite número do solo: '))
+    gt = classes_list[sel-1]
+    print(f'Solo selecionado: {gt}')
+
+    # Parâmetros martelo e DAS
+    f0, dur = 20.0, 0.1
+    fiber_km, dt_fast = 50.0, 500e-6
+    fs_fast = 1/dt_fast
+    prf = 1000
+    dz = 1.0
+    fiber_length = fiber_km*1e3
+    n_g = int(fiber_length/dz)
+    z = np.linspace(dz/2, fiber_length-dz/2, n_g)
+
+    # Perfil homogêneo
+    vp0 = vel_map[gt]
+    v_profile = np.full(n_g, vp0)
+    dt_fdtd = dz/(vp0*1.1)
+
+    # Scatterers + pulso + FDTD
+    phasors = generate_reflectors(100, n_g, scale=1e-4)
+    pulse, _ = ricker_wavelet(f0, dur, dt_fdtd)
+    u = simulate_fdtd(v_profile, dz, dt_fdtd, pulse, src_pos=0)
+    strain = np.gradient(u, dz, axis=0)
+
+    # DAS
+    params = {
+        'dz': dz, 'n_refr': 1.468, 'lambda0': 1550e-9, 'omega_if': 2*np.pi*10e6,
+        'dt_fast': dt_fast, 'n_pulses': 200, 'prf': prf, 'c_group': 2e8,
+        'gating_window': int(100e-6/dt_fast), 'adc_bits': 12,
+        'full_scale': 1.0, 'sigma_phi': 0.01
+    }
+    raw_if, gated_q, strain_est = simulate_das(strain, phasors, z, params)
+
+    # Inversões Vp
+    vp_fast, t_fast_arr = invert_vp_fast(z, dt_fast, params['c_group'])
+    vp_slow, t_slow_arr, _ = invert_vp_slow(strain_est, prf, z)
+
+    # Classificação inicial e estatísticas
+    soil_ext = classify_soil_complex(vp_slow)
+    df = pd.DataFrame({'Vp': vp_slow, 'Classe': soil_ext})
+    stats = df.groupby('Classe')['Vp'].agg(
+        contagem='count',
+        media='mean',
+        mediana='median',
+        desvio_padrao='std'
+    )
+    print('\nEstatísticas de Vp por classe (PT-BR):')
+    print(stats)
+    acc = np.nanmean(soil_ext == gt)
+    print(f'Acurácia de identificação (slow-time vs ground truth): {acc*100:.2f}%')
+
+    # Extração de features e normalização
+    feat = extract_features(raw_if, strain_est, z, dt_fast)
+    X = StandardScaler().fit_transform(feat)
+    le = LabelEncoder().fit(soil_ext)
+    y_enc = le.transform(soil_ext)
+    y_cat = to_categorical(y_enc)
+
+    # Validação cruzada
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    cv_scores = []
+    for tr, va in skf.split(X, soil_ext):
+        m = build_model(X.shape[1], y_cat.shape[1])
+        m.fit(X[tr], y_cat[tr], epochs=5, batch_size=128, verbose=0)
+        cv_scores.append(m.evaluate(X[va], y_cat[va], verbose=0)[1])
+    print(f'CV Accuracy: {np.mean(cv_scores)*100:.2f}% ± {np.std(cv_scores)*100:.2f}%')
+
+    # Treino final e predição
+    final = build_model(X.shape[1], y_cat.shape[1])
+    final.fit(X, y_cat, epochs=5, batch_size=128, verbose=0)
+    probas = final.predict(X)
+    top1 = le.inverse_transform(np.nanargmax(probas, axis=1))
+
+    # 12) Plots com legendas legíveis
+
+    # 12.1) Raw DAS signature
+    plt.figure(figsize=(10,5))
+    for i in range(0,100,5):
+        plt.plot(raw_if[i], alpha=0.7)
+    plt.title('Assinatura bruta do DAS (múltiplos canais)')
+    plt.xlabel('Índice de amostra (fast-time)')
+    plt.ylabel('Amplitude do sinal')
+    plt.legend(['Raw DAS signals'], loc='upper center', bbox_to_anchor=(0.5,-0.1), ncol=1)
+    plt.tight_layout()
+    plt.savefig(os.path.join(OUTPUT_DIR,'raw_signature.png'))
+
+    # 12.2) Envelope + picos (canal central)
+    env = np.abs(hilbert(raw_if[n_g//2]))
+    peaks, _ = find_peaks(env, distance=fs_fast*dur*0.1)
+    plt.figure(figsize=(8,4))
+    plt.plot(env, label='Envoltória (canal central)')
+    plt.plot(peaks, env[peaks], 'rx', label='Picos detectados')
+    plt.title('Envoltória & Picos')
+    plt.xlabel('Índice de amostra (fast-time)')
+    plt.ylabel('Amplitude')
+    plt.legend(loc='upper right')
+    plt.tight_layout()
+    plt.savefig(os.path.join(OUTPUT_DIR,'envelope_peaks.png'))
+
+    # 12.3) Composição de ondas por canal
+    plt.figure(figsize=(10,5))
+    for i in range(0,n_g,max(1,n_g//20)):
+        plt.plot(raw_if[i], alpha=0.4)
+    plt.title('Composição de ondas por canal')
+    plt.xlabel('Índice de amostra (fast-time)')
+    plt.ylabel('Amplitude')
+    plt.legend(['Signals'], loc='upper center', bbox_to_anchor=(0.5,-0.1))
+    plt.tight_layout()
+    plt.savefig(os.path.join(OUTPUT_DIR,'composition.png'))
+
+    # 12.4) Perfil Vp slow-time
+    plt.figure(figsize=(8,4))
+    plt.plot(z, vp_slow, label='Vp estimada')
+    plt.title('Perfil de Vp (slow-time)')
+    plt.xlabel('Profundidade (m)')
+    plt.ylabel('Vp (m/s)')
+    plt.legend(loc='lower right')
+    plt.tight_layout()
+    plt.savefig(os.path.join(OUTPUT_DIR,'vp_profile.png'))
+
+    # 12.5) Heatmap de strain estimado
+    plt.figure(figsize=(6,4))
+    im = plt.imshow(strain_est, aspect='auto', origin='lower',
+                    extent=[0, strain_est.shape[1], z[0], z[-1]])
+    plt.title('Mapa de calor de strain estimado')
+    plt.xlabel('Índice de pulso (slow-time)')
+    plt.ylabel('Profundidade (m)')
+    cbar = plt.colorbar(im)
+    cbar.set_label('Strain')
+    # Explicação:
+    plt.text(0.5, -0.15,
+        'Cada ponto mostra a deformação estimada para cada gauge (eixo Y)\n'
+        'e cada pulso (eixo X). Amarelo = maior strain, roxo = menor.',
+        ha='center', va='top', transform=plt.gca().transAxes, fontsize=8)
+    plt.tight_layout()
+    plt.savefig(os.path.join(OUTPUT_DIR,'heatmap_strain.png'))
+
+    # 12.6) Índice de chegada vs profundidade
+    idx_slow = np.argmax(np.abs(strain_est), axis=1)
+    plt.figure(figsize=(6,4))
+    plt.scatter(idx_slow, z, s=1, c='blue', label='Índices de chegada')
+    plt.title('Índice de chegada vs Profundidade')
+    plt.xlabel('Índice de pulso (slow-time)')
+    plt.ylabel('Profundidade (m)')
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(OUTPUT_DIR,'arrival_depth.png'))
+
+    # 12.7) Distribuição de classes geotécnicas
+    unique, counts = np.unique(soil_ext, return_counts=True)
+    plt.figure(figsize=(8,4))
+    plt.bar(unique, counts, color='tab:green')
+    plt.title('Distribuição de classes geotécnicas')
+    plt.xlabel('Classe')
+    plt.ylabel('Contagem')
+    plt.xticks(rotation=45, ha='right')
+    plt.tight_layout()
+    plt.savefig(os.path.join(OUTPUT_DIR,'soil_hist_extended.png'))
+
+    # 12.8) Estatísticas de Vp por classe (gráfico)
+    plt.figure(figsize=(8,4))
+    stats[['media','mediana']].plot.bar(yerr=stats['desvio_padrao'], rot=45)
+    plt.title('Estatísticas de Vp por classe (PT-BR)')
+    plt.xlabel('Classe')
+    plt.ylabel('Vp (m/s)')
+    plt.tight_layout()
+    plt.savefig(os.path.join(OUTPUT_DIR,'vp_stats_by_class.png'))
+
+    # 13) Salvamento completo em HDF5
+    with h5py.File(os.path.join(OUTPUT_DIR,'photondam_full.h5'),'w') as hf:
+        hf.create_dataset('z', data=z)
+        hf.create_dataset('vp_slow', data=vp_slow)
+        hf.create_dataset('soil_pred', data=np.bytes_(top1))
+        hf.create_dataset('probabilities', data=probas)
+        hf.create_dataset('features', data=feat)
+        hf.create_dataset('stats_contagem', data=stats['contagem'].values)
+        hf.create_dataset('stats_media', data=stats['media'].values)
+        hf.create_dataset('stats_mediana', data=stats['mediana'].values)
+        hf.create_dataset('stats_desvio', data=stats['desvio_padrao'].values)
+        hf.attrs['ground_truth'] = gt
+        hf.attrs['ident_acc'] = acc
+        hf.attrs['CV_acc_mean'] = np.mean(cv_scores)
+        hf.attrs['CV_acc_std'] = np.std(cv_scores)
+    print('Pipeline completo executado. Resultados em', OUTPUT_DIR)
+
+if __name__ == '__main__':
+    main()
