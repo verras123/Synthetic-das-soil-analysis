@@ -33,7 +33,7 @@ from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import Dense, Dropout, Input
 from tensorflow.keras.utils import to_categorical
 
-OUTPUT_DIR = '/content/drive/MyDrive/PhotonDAM_output'
+OUTPUT_DIR = '/content/drive/MyDrive/synthetic_das_soil_analysis/out'
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # 2) Lista de classes e mapeamento de velocidade típica
@@ -361,3 +361,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
