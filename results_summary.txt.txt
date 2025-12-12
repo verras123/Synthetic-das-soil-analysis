@@ -1,0 +1,38 @@
+Selecione o solo para simular e testar:
+1: Turfa/Lama
+2: Loam
+3: Argila mole
+4: Argila firme/Limo
+5: Silt Arenoso
+6: Areia solta
+7: Areia densa/Seixo
+8: Areia/Gravel
+9: Rocha macia
+10: Xisto/Calcário
+11: Basalto/Granito
+Digite número do solo: 11
+Solo selecionado: Basalto/Granito
+/tmp/ipython-input-2101146015.py:119: RuntimeWarning: divide by zero encountered in divide
+  vp = (2*z)/t_arr
+/tmp/ipython-input-2101146015.py:126: RuntimeWarning: divide by zero encountered in divide
+  vp = z/t_arr
+
+Estatísticas de Vp por classe (PT-BR):
+                   contagem          media        mediana  desvio_padrao
+Classe                                                                  
+                          0            NaN            NaN            NaN
+Areia densa/Seixo        59    1790.049148    1819.230769   1.388631e+02
+Areia solta              30    1369.877914    1373.216401   9.282179e+01
+Areia/Gravel             46    2234.191157    2210.696164   1.568438e+02
+Argila firme/Limo        13     792.481729     773.076923   6.139152e+01
+Argila mole              25     594.206623     589.947090   5.768728e+01
+Basalto/Granito       49273  757328.375347  253820.987654   2.560002e+06
+Loam                     17     396.928474     390.052356   5.056616e+01
+Rocha macia              80    2989.934194    3049.868295   3.019650e+02
+Silt Arenoso             26    1090.961670    1097.426349   7.075936e+01
+Turfa/Lama               31     146.528617     150.000000   8.670389e+01
+Xisto/Calcário          158    4239.591325    4199.798748   4.284201e+02
+Acurácia de identificação (slow-time vs ground truth): 98.55%
+CV Accuracy: 98.52% ± 0.03%
+1563/1563 ━━━━━━━━━━━━━━━━━━━━ 2s 1ms/step
+Pipeline completo executado. Resultados em /content/drive/MyDrive/PhotonDAM_output
